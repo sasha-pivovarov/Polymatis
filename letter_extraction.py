@@ -47,7 +47,11 @@ class LetterDetection:
 
 
 
-    def pdf_to_jpg_stream(self, pdfpath, start, end):
+    def pdf_to_jpg_stream(self, pdfpath, start, end) -> str:
+        """
+        Yields the pages of a pdf document as png images. Involves a subprocess call to a Linux program so probably not cross-platform.
+        Make sure pdfimages is installed, else do sudo apt-get install poppler-utils or xpdf or what have you.
+        """
         foldername = path.splitext(pdfpath)[0].split('/')[-1]
         dumppath = ("pngs/" + foldername + '/')
         if not path.exists(dumppath):
@@ -64,13 +68,19 @@ class LetterDetection:
                 yield dumppath + y
 
 
-    def resize_page(self, page):
+    def resize_page(self, page, rate=700):
+        """
+        Resize a page to constant height.
+        """
         height, width = page.shape[:2]
-        ratio = 700 / float(height)
+        ratio = rate / float(height)
         return cv2.resize(page, (int(width * ratio), int(height * ratio)), interpolation=cv2.INTER_AREA)
 
 
     def transform_page(self, page, resize=True):
+        """
+        Convert a page to grayscale, apply the bilateral filter, threshold the image, in that order. Resizing optional.
+        """
         image = cv2.imread(page, cv2.IMREAD_COLOR)
         if resize:
             image = self.resize_page(image)
@@ -88,6 +98,10 @@ class LetterDetection:
 
 
     def get_bounding_box(self, image, skewCorrection=False, verbose=False):
+        """
+        Returns the minimal rectangle around the text area. May also attemt to correct skew but the results are kinda gross so far.
+        Deprecated, use get_text_region_bounds instead until I sort this out.
+        """
         #display_image = image.copy()
         eroded_image = cv2.erode(image, self.erosion_element)
 
@@ -129,11 +143,17 @@ class LetterDetection:
 
 
     def get_contours(self, image):
+        """
+        Gets the contours of all the characters (and persistent fly crap samples) in the image.
+        """
         im, contours, hierarchy = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
         return im, contours, hierarchy
 
 
     def cut_contours(self, image, contours):
+        """
+        Crops all the characters in the image out in their minimal rectangles and returns them after thresholding.
+        """
         for contour in contours:
             mask = np.zeros_like(image)
             cv2.drawContours(mask, [contour], -1, 255, cv2.FILLED, cv2.LINE_8)  #(mask, [contour], -1, 255, -1, cv2.FILLED)
@@ -161,6 +181,9 @@ class LetterDetection:
 
 
     def get_text_region_bounds(self, bin_image):
+        """
+        Same as get_bounding_box, but just the essentials.
+        """
         eroded_image = cv2.erode(bin_image, self.erosion_element)
         cv2.imwrite("Eroded_image.png", eroded_image)
         points = cv2.findNonZero(eroded_image)
@@ -168,6 +191,9 @@ class LetterDetection:
 
 
     def boxes_to_spaces(self, boxes):
+        """
+        Takes an array of symbol bounding boxes and returns an array of space lengths.
+        """
         spaces = []
         left_coords = [x[0] for x in boxes]
         for box in boxes:
@@ -181,14 +207,16 @@ class LetterDetection:
         return spaces
 
 
-    def get_spacing_distribution(self, pdf, verbose):
-
+    def get_spacing_distribution(self, pdf, verbose, start=40, end=50):
+        """
+        Calculates the distribution of space sizes in the image. Also returns the average color.
+        """
         crop = None
         answered = False
         avg_color = None
 
         while not answered:
-            for page in self.pdf_to_jpg_stream(pdf, 40, 50):
+            for page in self.pdf_to_jpg_stream(pdf, start, end):
                 bin_page = self.transform_page(page)
                 x, y, w, h = self.get_text_region_bounds(bin_page)
                 crop = bin_page[y: (y + h), x: (x + w)]
@@ -225,10 +253,17 @@ class LetterDetection:
 
 
     def get_mean_color(self, page):
+        """
+        As it says on the tin. Note: will be changed to return the average color of textless areas only, but right now it includes
+        characters, so the resulting color is a little darker.
+        """
         return np.uint8(np.average(np.average(page[:, 0:10], axis=0), axis=0))
 
 
     def generate_phrases(self, pdf, text, verbose=False):
+        """
+        Generates the Unicode phrases in text as png images of lines, using the symbols in pdf.
+        """
         spacing_distribution = (3, 2, (118, 166, 196))
         pdf_name = path.splitext(pdf)[0].split('/')[-1]
         symbols = {x : [cv2.imread("symbol_shapes/" + pdf_name + "/"+ x + "/" + y, cv2.IMREAD_COLOR) for y in listdir("symbol_shapes/" + pdf_name + "/" + x)] for x in listdir("symbol_shapes/" + pdf_name)}
@@ -293,6 +328,9 @@ class LetterDetection:
 
 
     def extract_nonbin_symbols(self, pdfs, grayscale=False):
+        """
+        Produces color images of the characters in pdfs.
+        """
         for pdf, page_range in pdfs.items():
             bin_syms = []
             nonbin_syms = []
@@ -346,11 +384,17 @@ class LetterDetection:
 
 
     def extract_and_cluster(self, pdfs):
+        """
+        Extracts symbols from the pdfs and then clusters them.
+        """
         for syms in self.extract_nonbin_symbols(pdfs):
             self.cluster_symbols(syms[0], syms[2], nonbin_syms=syms[1])
 
 
     def extract_symbols(self, pdfs):
+        """
+        Produces binary images of the symbols in pdfs.
+        """
         #counter = 1
         #toreturn = []
         for pdf, page_range in pdfs.items():
@@ -384,6 +428,9 @@ class LetterDetection:
 
 
     def prepare_for_clustering(self, symbols, max_dims, verbose=False):
+        """
+        Pads symbols out with zeros to make a homogenous feature space.
+        """
         #max_dims = (max([x.shape[0] for x in symbols]), max([y.shape[1] for y in symbols]))
         padded_symbols = []
         for symbol in symbols:
@@ -416,6 +463,9 @@ class LetterDetection:
 
 
     def cluster_symbols(self, symbols, directory, verbose=False, nonbin_syms=None):
+        """
+        Uses Affinity Propagation to cluster the symbols and put them in directory.
+        """
         #paths = [y for y in listdir("symbol_shapes") if path.isfile("symbol_shapes/" + y)]
         #symbols = [cv2.imread("symbol_shapes/" + x, cv2.IMREAD_GRAYSCALE) for x in paths]
         selection = NMF(n_components=200, init="nndsvda")
@@ -448,6 +498,9 @@ class LetterDetection:
 
 
     def GridSearchAP(self, damping, preference, n_features, objects):
+        """
+        Tries to the best hyperparameters for AfProp based on sillhouette score. Works like garbage, to be honest.
+        """
         results = {}
 
 
@@ -469,6 +522,9 @@ class LetterDetection:
 
 
     def prepare_for_classification(self, pdfnames):
+        """
+        Pads out the training symbols and makes label arrays for them.
+        """
         symbols = []
         labels = []
         for name in pdfnames:
@@ -490,6 +546,9 @@ class LetterDetection:
 
 
     def classify_symbols(self, pdfs, training_folders):
+        """
+        Classifies the symbols in pdfs using a random forest trained using the symbols in training_folders.
+        """
         training_syms, training_labels = self.prepare_for_classification(training_folders)
         for test_bins, test_nbs, textname in self.extract_nonbin_symbols(pdfs):
             test_padded = self.prepare_for_clustering(test_bins, (25, 25))
@@ -500,7 +559,7 @@ class LetterDetection:
             classifier.fit(train, training_labels)
             predicted = classifier.predict(test)
 
-            foldername = "symbol_shapes/"+textname + "/"
+            foldername = "symbol_shapes/"+ textname + "/"
             for i in range(len(predicted)):
                 curdir = foldername + predicted[i] + "_pred/"
                 if not path.exists(curdir):
