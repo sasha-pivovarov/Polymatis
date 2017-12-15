@@ -16,6 +16,10 @@ from sklearn.naive_bayes import BernoulliNB
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
 from sklearn.decomposition import PCA, NMF
 from sklearn.pipeline import make_pipeline
+from keras.preprocessing.image import ImageDataGenerator
+from keras.models import Sequential
+from keras.layers import Conv2D, MaxPooling2D
+from keras.layers import Activation, Dropout, Flatten, Dense
 from os import listdir, makedirs, path
 import time
 
@@ -24,6 +28,8 @@ class LetterDetection:
     detector = None
     struct_element = None
     sColor = None
+    imagegen = ImageDataGenerator(rotation_range=20, width_shift_range=0.1, height_shift_range=0.1, shear_range=0.1, zoom_range=0.1
+                                  ,channel_shift_range=0, fill_mode="constant", cval=0, data_format="channels_first")
     sSpace = None
     clahe = cv2.createCLAHE(2.0, (4, 4))
     special_chars = {"dot": "·"}
@@ -427,7 +433,7 @@ class LetterDetection:
         #return toreturn
 
 
-    def prepare_for_clustering(self, symbols, max_dims, verbose=False):
+    def prepare_for_clustering(self, symbols, max_dims, verbose=False, flatten=True):
         """
         Pads symbols out with zeros to make a homogenous feature space.
         """
@@ -445,8 +451,10 @@ class LetterDetection:
             if verbose:
                 cv2.imshow(repr(toappend.shape) , toappend)
                 cv2.waitKey()
-
-            padded_symbols.append([int(x != 0) for x in toappend.flatten()])
+            if flatten:
+                padded_symbols.append([int(x != 0) for x in toappend.flatten()])
+            else:
+                padded_symbols.append(toappend.reshape((1,1)+toappend.shape))
 
         return padded_symbols
 
@@ -521,7 +529,7 @@ class LetterDetection:
         return name.split("_")[0]
 
 
-    def prepare_for_classification(self, pdfnames):
+    def prepare_for_classification(self, pdfnames, pad_out=True, flatten=True):
         """
         Pads out the training symbols and makes label arrays for them.
         """
@@ -535,7 +543,12 @@ class LetterDetection:
                 dirpath = foldername + "/" + dirname
                 name = self.parse_name(dirname)
                 syms = [self.transform_page(dirpath + "/" + x, False) for x in listdir(dirpath)]
-                new_symbols = self.prepare_for_clustering(syms, (25, 25))
+                if pad_out and flatten:
+                    new_symbols = self.prepare_for_clustering(syms, (25, 25))
+                elif pad_out:
+                    new_symbols = self.prepare_for_clustering(syms, (25, 25), flatten=False)
+                else:
+                    new_symbols = [x.reshape((1,1) + x.shape) for x in syms]
                 new_labels = [name for x in range(len(syms))]
                 assert len(new_labels) == len(new_symbols)
                 symbols.extend(new_symbols)
@@ -587,6 +600,34 @@ class LetterDetection:
             textfile.write(classification_report(y_test, pred))
 
         textfile.close()
+
+
+    def nn_tests(self, symbols, labels):
+        # i = 0
+        # for batch in self.imagegen.flow(symbols[0], batch_size=1,
+        #                           save_to_dir='preview', save_prefix='sym', save_format='png'):
+        #     i += 1
+        #     if i > 20:
+        #         break
+        print(len(set(labels)))
+        model = Sequential()
+        model.add(Conv2D(32, (3, 3), input_shape=(3, 25, 25)))
+        model.add(Activation('relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2)))
+
+        model.add(Conv2D(32, (3, 3)))
+        model.add(Activation('relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2)))
+
+        model.add(Conv2D(64, (3, 3)))
+        model.add(Activation('relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2)))
+
+        model.add(Flatten())  # this converts our 3D feature maps to 1D feature vectors
+        model.add(Dense(64))
+        model.add(Activation('relu'))
+        model.add(Dropout(0.5))
+        model.add(Dense(39))
 
 
     def classifier_tests_secondstage(self, X_tr, y_tr, X_test, y_test):
@@ -659,11 +700,12 @@ if __name__ == "__main__":
     #                                   "ostromirovo.pdf":(70, 90, False),
     #                                    "kievan.pdf":(70, 90, False)})
     # detection.clustering_tests({"kievgospel.pdf":(30, 40, False)})
-    symbols, labels = detection.prepare_for_classification(["kievgospel"])
-    sym_test, label_test = detection.prepare_for_classification(["ostromirovo"])
+    symbols, labels = detection.prepare_for_classification(["kievgospel", "ostromirovo", "kievan"], pad_out=False, flatten=False)
+    # sym_test, label_test = detection.prepare_for_classification(["ostromirovo"])
     # detection.classify_symbols({"kievgospel.pdf": (20, 40, False)}, ["kievgospel"])
     # #detection.cluster_symbols(symbols)
-    detection.classifier_tests_secondstage(symbols, labels, sym_test, label_test)
+    #detection.classifier_tests_secondstage(symbols, labels, sym_test, label_test)
+    detection.nn_tests(symbols, labels)
 
 
 
