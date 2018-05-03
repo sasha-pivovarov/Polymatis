@@ -1,43 +1,53 @@
 #encoding: utf-8
 #from wand.image import Image, Color
 #from PIL import Image
-import subprocess
+
 import cv2
 import io
 import numpy as np
 import random
+from datetime import datetime
 from math import fabs
-from sklearn.cluster import AffinityPropagation, MeanShift, DBSCAN
-from sklearn.preprocessing import normalize
-from sklearn.metrics import silhouette_score, classification_report, silhouette_samples
-from sklearn.model_selection import GridSearchCV, train_test_split
-from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import silhouette_score, classification_report, silhouette_samples, accuracy_score, precision_score, f1_score
+from sklearn.model_selection import GridSearchCV, train_test_split, StratifiedKFold
 from sklearn.naive_bayes import BernoulliNB
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier
 from sklearn.decomposition import PCA, NMF
 from sklearn.pipeline import make_pipeline
+import os
+# import os
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
+# os.environ["CUDA_VISIBLE_DEVICES"] = ""
 from keras.preprocessing.image import ImageDataGenerator
 from keras.models import Sequential
-from keras.layers import Conv2D, MaxPooling2D
-from keras.layers import Activation, Dropout, Flatten, Dense
+from keras.layers import Conv2D, MaxPooling2D, GRU
+from keras.layers import Activation, Dropout, Flatten, Dense, Reshape, Input
+from keras.utils import to_categorical
+from keras.wrappers.scikit_learn import KerasClassifier
 from os import listdir, makedirs, path
 import time
+from utils import *
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 
 class LetterDetection:
 
-    detector = None
-    struct_element = None
-    sColor = None
-    imagegen = ImageDataGenerator(rotation_range=20, width_shift_range=0.1, height_shift_range=0.1, shear_range=0.1, zoom_range=0.1
+    #detector = None
+    #struct_element = None
+    #sColor = None
+    imagegen_aug = ImageDataGenerator(rotation_range=20, width_shift_range=0.1, height_shift_range=0.1, shear_range=0.1, zoom_range=0.1
                                   ,channel_shift_range=0, fill_mode="constant", cval=0, data_format="channels_first")
-    sSpace = None
+    imagegen_noaug = ImageDataGenerator(data_format="channels_first")
+    #sSpace = None
     clahe = cv2.createCLAHE(2.0, (4, 4))
     special_chars = {"dot": "·"}
     placements = {"upper":[],
                   "lower":[]}
     #image_dump_path = None
 
-    def __init__(self, areafilter, selement_h, selement_w, scolor, sspace, areamin=0, areamax=5000):
+    def __init__(self, areafilter, selement_h, selement_w, scolor, sspace, areamin=0, areamax=5000, log="log.txt"):
         params = cv2.SimpleBlobDetector_Params()
         params.filterByArea = areafilter
         if areafilter:
@@ -48,39 +58,15 @@ class LetterDetection:
         self.selection = NMF(n_components=180, init="nndsvda")
         self.sColor = scolor
         self.sSpace = sspace
+        self.logpath = log
+        self.log('\n' + str(datetime.now()))
 
         #self.image_dump_path = image_path
 
 
-
-    def pdf_to_jpg_stream(self, pdfpath, start, end) -> str:
-        """
-        Yields the pages of a pdf document as png images. Involves a subprocess call to a Linux program so probably not cross-platform.
-        Make sure pdfimages is installed, else do sudo apt-get install poppler-utils or xpdf or what have you.
-        """
-        foldername = path.splitext(pdfpath)[0].split('/')[-1]
-        dumppath = ("pngs/" + foldername + '/')
-        if not path.exists(dumppath):
-            makedirs(dumppath)
-            subprocess.call(["pdfimages", "-png", "pdfs/" + pdfpath, dumppath])
-
-
-        for y in listdir(dumppath):
-            try:
-                ynum = int((path.splitext(y)[0].split('-')[1].lstrip("0")))
-            except ValueError:
-                ynum = 0
-            if path.isfile(dumppath + y) and ynum in range(start, end):
-                yield dumppath + y
-
-
-    def resize_page(self, page, rate=700):
-        """
-        Resize a page to constant height.
-        """
-        height, width = page.shape[:2]
-        ratio = rate / float(height)
-        return cv2.resize(page, (int(width * ratio), int(height * ratio)), interpolation=cv2.INTER_AREA)
+    def log(self, string):
+        with open(self.logpath, "a") as io:
+            io.write(string + '\n')
 
 
     def transform_page(self, page, resize=True):
@@ -89,7 +75,7 @@ class LetterDetection:
         """
         image = cv2.imread(page, cv2.IMREAD_COLOR)
         if resize:
-            image = self.resize_page(image)
+            image = resize_page(image)
         image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         cv2.imwrite("Grayscale_img.png", image_gray)
         #image_gray = self.clahe.apply(image_gray)
@@ -148,44 +134,6 @@ class LetterDetection:
         #cv2.imshow("img", img_with_box)
 
 
-    def get_contours(self, image):
-        """
-        Gets the contours of all the characters (and persistent fly crap samples) in the image.
-        """
-        im, contours, hierarchy = cv2.findContours(image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS)
-        return im, contours, hierarchy
-
-
-    def cut_contours(self, image, contours):
-        """
-        Crops all the characters in the image out in their minimal rectangles and returns them after thresholding.
-        """
-        for contour in contours:
-            mask = np.zeros_like(image)
-            cv2.drawContours(mask, [contour], -1, 255, cv2.FILLED, cv2.LINE_8)  #(mask, [contour], -1, 255, -1, cv2.FILLED)
-            out = np.zeros_like(image)
-            out[mask==255] = image[mask==255]
-            points = cv2.findNonZero(out)
-
-            try:
-                bound_box = cv2.minAreaRect(points)
-                angle = bound_box[2]
-                size = bound_box[1]
-                if angle < -45:
-                    angle += 90
-                    size = tuple([size[1], size[0]])
-
-                ret, cropped_image = cv2.threshold(cv2.getRectSubPix(out, tuple([int(round(x)) for x in size]),
-                                                                         tuple([int(round(x)) for x in bound_box[0]])),
-                                                   thresh=1, type=cv2.THRESH_BINARY, maxval=255)
-
-                assert size[0] > 0 and size[1] > 0 and len(points) > 40
-                yield  cropped_image
-
-            except (AssertionError, cv2.error):
-                continue
-
-
     def get_text_region_bounds(self, bin_image):
         """
         Same as get_bounding_box, but just the essentials.
@@ -194,23 +142,6 @@ class LetterDetection:
         cv2.imwrite("Eroded_image.png", eroded_image)
         points = cv2.findNonZero(eroded_image)
         return cv2.boundingRect(points)
-
-
-    def boxes_to_spaces(self, boxes):
-        """
-        Takes an array of symbol bounding boxes and returns an array of space lengths.
-        """
-        spaces = []
-        left_coords = [x[0] for x in boxes]
-        for box in boxes:
-            own_right = box[1] + box[3]
-            try:
-                next_left = min([x for x in left_coords if x > own_right])
-                spaces.append(next_left - own_right)
-            except ValueError:
-                continue
-
-        return spaces
 
 
     def get_spacing_distribution(self, pdf, verbose, start=40, end=50):
@@ -222,7 +153,7 @@ class LetterDetection:
         avg_color = None
 
         while not answered:
-            for page in self.pdf_to_jpg_stream(pdf, start, end):
+            for page in pdf_to_jpg_stream(pdf, start, end):
                 bin_page = self.transform_page(page)
                 x, y, w, h = self.get_text_region_bounds(bin_page)
                 crop = bin_page[y: (y + h), x: (x + w)]
@@ -234,7 +165,7 @@ class LetterDetection:
                 elif answer != "y":
                     print("Please answer one of Y|N.")
                 else:
-                    avg_color = self.get_mean_color(page)
+                    avg_color = get_mean_color(page)
                     answered = True
                     break
 
@@ -242,7 +173,7 @@ class LetterDetection:
             swatch = np.array([[[avg_color] * 100] * 100], np.uint8)
             cv2.imshow("Average text color", swatch)
             cv2.waitKey()
-        im, contours, hierarchy = self.get_contours(crop)
+        im, contours, hierarchy = get_contours(crop)
         boxes = [cv2.boundingRect(x) for x in contours]
         lines = []
         spaces = []
@@ -253,17 +184,9 @@ class LetterDetection:
             if not [(box_yrange[0] in range(x[0], x[1]) or box_yrange[1] in range(x[0], x[1])) for x in [y[0] for y in lines]].__contains__(True):
                 line_boxes = [linebox for linebox in boxes if linebox[1] in range(box_yrange[0], box_yrange[1]) or (linebox[1] + linebox[3]) in range(box_yrange[0], box_yrange[1])]
                 lines.append((min([x[1] for x in line_boxes]), max((x[1] + x[3]) for x in line_boxes)))
-                spaces.extend(self.boxes_to_spaces(line_boxes))
+                spaces.extend(boxes_to_spaces(line_boxes))
 
         return np.mean(spaces), np.std(spaces), avg_color
-
-
-    def get_mean_color(self, page):
-        """
-        As it says on the tin. Note: will be changed to return the average color of textless areas only, but right now it includes
-        characters, so the resulting color is a little darker.
-        """
-        return np.uint8(np.average(np.average(page[:, 0:10], axis=0), axis=0))
 
 
     def generate_phrases(self, pdf, text, verbose=False):
@@ -342,9 +265,9 @@ class LetterDetection:
             nonbin_syms = []
             text_name = path.splitext(pdf)[0].split('/')[-1]
             verbose = page_range[2]
-            for page in self.pdf_to_jpg_stream(pdf, page_range[0], page_range[1]):
+            for page in pdf_to_jpg_stream(pdf, page_range[0], page_range[1]):
                 try:
-                    nonbin_page = self.resize_page(cv2.imread(page))
+                    nonbin_page = resize_page(cv2.imread(page))
                     if grayscale:
                         nonbin_page = cv2.cvtColor(nonbin_page, cv2.COLOR_BGR2GRAY)
 
@@ -363,7 +286,7 @@ class LetterDetection:
                         cv2.imshow("Binarized crop", bin_crop)
                         cv2.waitKey()
 
-                    img, contours, hierarchy = self.get_contours(bin_crop)
+                    img, contours, hierarchy = get_contours(bin_crop)
                     display_img = img.copy()
                     cv2.drawContours(display_img, contours, -1, (255, 115, 10), 3)
                     cv2.imwrite("Contours_img.png", display_img)
@@ -394,7 +317,7 @@ class LetterDetection:
         Extracts symbols from the pdfs and then clusters them.
         """
         for syms in self.extract_nonbin_symbols(pdfs):
-            self.cluster_symbols(syms[0], syms[2], nonbin_syms=syms[1])
+            cluster_symbols(syms[0], syms[2], nonbin_syms=syms[1])
 
 
     def extract_symbols(self, pdfs):
@@ -407,7 +330,7 @@ class LetterDetection:
             sym_array = []
             verbose = page_range[2]
             text_name = path.splitext(pdf)[0].split('/')[-1]
-            for page in self.pdf_to_jpg_stream(pdf, page_range[0], page_range[1]):
+            for page in pdf_to_jpg_stream(pdf, page_range[0], page_range[1]):
 
                 thr_image = self.transform_page(page)
                 if verbose:
@@ -418,118 +341,22 @@ class LetterDetection:
                     cv2.imshow(page + "_" + "cropped", cropped_image)
                     cv2.waitKey()
                 if cropped_image != None:
-                    cr_im, contours, hierarchy = self.get_contours(cropped_image)
+                    cr_im, contours, hierarchy = get_contours(cropped_image)
                     display_img = cr_im.copy()
                     cv2.drawContours(display_img, contours, -1, (255, 115, 10), 3)
                     cv2.imwrite("Contours.png", display_img)
                     if verbose:
                         cv2.imshow(page + "_" + "contours", display_img)
                         cv2.waitKey()
-                    for image in self.cut_contours(cropped_image, contours):
+                    for image in cut_contours(cropped_image, contours):
                         sym_array.append(image)
-            self.cluster_symbols(sym_array, text_name, verbose=verbose)
+            cluster_symbols(sym_array, text_name, verbose=verbose)
                         #cv2.imwrite("symbol_shapes/%d.png" % (counter), image)
                         #counter += 1
         #return toreturn
 
-
-    def prepare_for_clustering(self, symbols, max_dims, verbose=False, flatten=True):
-        """
-        Pads symbols out with zeros to make a homogenous feature space.
-        """
-        #max_dims = (max([x.shape[0] for x in symbols]), max([y.shape[1] for y in symbols]))
-        padded_symbols = []
-        for symbol in symbols:
-            if symbol != None and symbol.shape[0] <= max_dims[0] and symbol.shape[1] <= max_dims[1]:
-                xdiff = max_dims[0] - symbol.shape[0]
-                ydiff = max_dims[1] - symbol.shape[1]
-                toappend = cv2.copyMakeBorder(symbol, bottom=xdiff, top=0, left=0, right=ydiff, borderType=cv2.BORDER_CONSTANT, value=0)
-                #assert toappend.shape[:2] == (25, 25)
-            else:
-                toappend = np.zeros((max_dims[0], max_dims[1], 1), np.uint8)
-
-            if verbose:
-                cv2.imshow(repr(toappend.shape) , toappend)
-                cv2.waitKey()
-            if flatten:
-                padded_symbols.append([int(x != 0) for x in toappend.flatten()])
-            else:
-                padded_symbols.append(toappend.reshape((1,1)+toappend.shape))
-
-        return padded_symbols
-
-    def get_mean_ss(self, labels, ss):
-        sslists = {}
-        result = {}
-        for i in range(len(labels)):
-            sslists[labels[i]] = sslists.get(labels[i], []) + [ss[i]]
-
-        for label, scores in sslists.items():
-            result[label] = np.mean(scores)
-
-        return result
-
-
-    def cluster_symbols(self, symbols, directory, verbose=False, nonbin_syms=None):
-        """
-        Uses Affinity Propagation to cluster the symbols and put them in directory.
-        """
-        #paths = [y for y in listdir("symbol_shapes") if path.isfile("symbol_shapes/" + y)]
-        #symbols = [cv2.imread("symbol_shapes/" + x, cv2.IMREAD_GRAYSCALE) for x in paths]
-        selection = NMF(n_components=200, init="nndsvda")
-        # scorer = make_scorer(silhouette_score)
-        # clustering = GridSearchCV(AffinityPropagation, {"damping":[0.5, 0.6, 0.7, 0.8],
-        #                                                 "preference":[5, 0, -1, -10]}, scoring=scorer)
-        clustering = AffinityPropagation(damping=0.8)
-        if not path.exists("symbol_shapes/" + directory):
-            makedirs("symbol_shapes/" + directory)
-        padded_symbols = self.prepare_for_clustering(symbols, (25, 25), verbose)
-        #results = self.GridSearchAP([0.6, 0.7, 0.8], [-1, -10], [20, 35, 50], padded_symbols)
-        #print(results)
-        #labels = results[max(results.keys())][0]
-        symbol_traits = selection.fit_transform(padded_symbols)
-        # clustering.fit(symbol_traits)
-        labels = clustering.fit_predict(symbol_traits)
-        silhouette_scores = silhouette_samples(symbol_traits, labels)
-        mean_ss_per_label = self.get_mean_ss(labels, silhouette_scores)
-        # print(clustering.best_params_)
-        for i in range(len(labels)):
-            curdir = "symbol_shapes/%s/%s"%(directory, str(mean_ss_per_label[labels[i]]).replace(".", "_"))
-            if not path.exists(curdir):
-                makedirs(curdir)
-            if not nonbin_syms:
-                cv2.imwrite(curdir + "/" + str(silhouette_scores[i]).replace(".", "_") + ".png", symbols[i])
-            else:
-                cv2.imwrite(curdir + "/" + str(silhouette_scores[i]).replace(".", "_") + ".png", nonbin_syms[i])
-
-        print("Done clustering %s"%directory)
-
-
-    def GridSearchAP(self, damping, preference, n_features, objects):
-        """
-        Tries to the best hyperparameters for AfProp based on sillhouette score. Works like garbage, to be honest.
-        """
-        results = {}
-
-
-        for p in preference:
-            for d in damping:
-                for n in n_features:
-                    selector = NMF(n_components=n, init="nndsvda")
-                    classifier = AffinityPropagation(damping=d, preference=p)
-                    sel_objs = selector.fit_transform(objects)
-                    labels = classifier.fit_predict(sel_objs)
-                    metric = silhouette_score(sel_objs, labels)
-                    results[metric] = (labels, "p=%d d=%d n=%d"%(p, d, n))
-
-        return results
-
-
-    def parse_name(self, name):
-        return name.split("_")[0]
-
-
-    def prepare_for_classification(self, pdfnames, pad_out=True, flatten=True):
+    # reshaper = lambda x, y: tuple([1, x, y, 1])
+    def prepare_for_classification(self, pdfnames, pad_out=True, flatten=True, padded_shape=(25, 25)):
         """
         Pads out the training symbols and makes label arrays for them.
         """
@@ -541,14 +368,14 @@ class LetterDetection:
 
             for dirname in dirnames:
                 dirpath = foldername + "/" + dirname
-                name = self.parse_name(dirname)
+                name = parse_name(dirname)
                 syms = [self.transform_page(dirpath + "/" + x, False) for x in listdir(dirpath)]
                 if pad_out and flatten:
-                    new_symbols = self.prepare_for_clustering(syms, (25, 25))
+                    new_symbols = prepare_for_clustering(syms, padded_shape)
                 elif pad_out:
-                    new_symbols = self.prepare_for_clustering(syms, (25, 25), flatten=False)
+                    new_symbols = prepare_for_clustering(syms, padded_shape, flatten=False)
                 else:
-                    new_symbols = [x.reshape((1,1) + x.shape) for x in syms]
+                    new_symbols = [x.reshape(tuple([1, x.shape[0], x.shape[1], 1])) for x in syms]
                 new_labels = [name for x in range(len(syms))]
                 assert len(new_labels) == len(new_symbols)
                 symbols.extend(new_symbols)
@@ -564,7 +391,7 @@ class LetterDetection:
         """
         training_syms, training_labels = self.prepare_for_classification(training_folders)
         for test_bins, test_nbs, textname in self.extract_nonbin_symbols(pdfs):
-            test_padded = self.prepare_for_clustering(test_bins, (25, 25))
+            test_padded = prepare_for_clustering(test_bins, (25, 25))
             classifier = GridSearchCV(RandomForestClassifier(), {"criterion":["gini", "entropy"], "max_features":["sqrt", "log2", None]})
             selector = NMF(100, "nndsvda")
             train = selector.fit_transform(training_syms)
@@ -601,33 +428,98 @@ class LetterDetection:
 
         textfile.close()
 
+    def create_nn(self, optimizer="sgd") -> Sequential:
+        model = Sequential()
 
-    def nn_tests(self, symbols, labels):
+        model.add(Conv2D(filters=32, input_shape=(1, 24, 24), kernel_size=(3, 3), data_format="channels_first"))
+        model.add(Activation('relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2), data_format="channels_first"))
+
+        model.add(Conv2D(64, (3, 3), data_format="channels_first"))
+        model.add(Activation('relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2), data_format="channels_first"))
+
+        model.add(Conv2D(64, (3, 3), data_format="channels_first"))
+        model.add(Activation('relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2), data_format="channels_first"))
+
+        model.add(Flatten())  # this converts our 3D feature maps to 1D feature vectors
+        #model.add(Reshape(target_shape=(4, 4*16)))
+        model.add(Dense(64))
+        model.add(Activation('relu'))
+
+        model.add(Dropout(0.5))
+        #model.add(GRU(64, return_sequences=True, kernel_initializer="he_normal"))
+        #model.add(GRU(64, return_sequences=True, go_backwards=True, kernel_initializer="he_normal"))
+        #model.add(GRU(64, return_sequences=True, kernel_initializer="he_normal"))
+        #model.add(GRU(64, return_sequences=True, go_backwards=True, kernel_initializer="he_normal"))
+        model.add(Dense(39, activation="softmax"))
+        model.summary()
+
+        model.summary(print_fn=self.log)
+        model.compile(optimizer=optimizer, loss="categorical_crossentropy", metrics=["accuracy"])
+        return model
+
+
+    def nn_tests(self, symbols, labels, optimizer, save_path, encoder_path="label_encoder.pkl"):
         # i = 0
         # for batch in self.imagegen.flow(symbols[0], batch_size=1,
         #                           save_to_dir='preview', save_prefix='sym', save_format='png'):
         #     i += 1
         #     if i > 20:
         #         break
+        self.log("\n++++++++++++++++++++++++++++++++++\n" + optimizer + "\n")
         print(len(set(labels)))
-        model = Sequential()
-        model.add(Conv2D(32, (3, 3), input_shape=(3, 25, 25)))
-        model.add(Activation('relu'))
-        model.add(MaxPooling2D(pool_size=(2, 2)))
+        print(len(symbols))
+        acc = 0
+        prec = 0
+        X = np.array(symbols)
+        y = np.array(labels)
+        f1 = 0
+        skf = StratifiedKFold(n_splits=4)
+        encoder = load_encoder("models/" + encoder_path)
+        for train_index, test_index in skf.split(X, y):
+            sym_train, sym_test = X[train_index], X[test_index]
+            lab_train, lab_test = y[train_index], y[test_index]
 
-        model.add(Conv2D(32, (3, 3)))
-        model.add(Activation('relu'))
-        model.add(MaxPooling2D(pool_size=(2, 2)))
 
-        model.add(Conv2D(64, (3, 3)))
-        model.add(Activation('relu'))
-        model.add(MaxPooling2D(pool_size=(2, 2)))
+            n_augmented = 0
+            aug_labels = []
+            aug_symbols = []
+            lab_train = to_categorical(encoder.transform(lab_train))
+            lab_test = to_categorical(encoder.transform(lab_test))
+            data_noaug = self.imagegen_noaug.flow(sym_train, lab_train)
+            data_aug = self.imagegen_aug.flow(sym_train, lab_train)
 
-        model.add(Flatten())  # this converts our 3D feature maps to 1D feature vectors
-        model.add(Dense(64))
-        model.add(Activation('relu'))
-        model.add(Dropout(0.5))
-        model.add(Dense(39))
+            model1 = self.create_nn(optimizer=optimizer)
+
+            model1.fit_generator(data_noaug, steps_per_epoch=500, epochs=50)
+            #model1.load_weights("model1.h5")
+            model1.save_weights("models/" + save_path)
+            self.log(f"Saved weights as {save_path}")
+
+            # model2 = self.create_nn()
+            # model2.fit_generator(data_aug, steps_per_epoch=500, epochs=50)
+            # # model2.load_weights("model2.h5")
+            # model2.save_weights("model2_2layers.h5")
+
+            pred1 = convert_nn_output(model1.predict(sym_test))
+            # pred2 = convert_nn_output(model2.predict(np.array(sym_test)))
+            acc += accuracy_score(lab_test, pred1)
+            prec += precision_score(lab_test, pred1, average="samples")
+            f1 += f1_score(lab_test, pred1, average="samples")
+            print(classification_report(encoder.inverse_transform(lab_test), encoder.inverse_transform(pred1)))
+            self.log(classification_report(encoder.inverse_transform(lab_test), encoder.inverse_transform(pred1)) + '\n======================================\n')
+
+
+        self.log(
+            """
+        ACCURACY: %s
+        PRECISION %s
+        F1: %s
+        """ % (str(acc/4.0), str(prec / 4.0), str(f1 / 4.0)))
+        print("++++++++++++++++++++++++++++++++++++++++++++++")
+        # print(classification_report(lab_test, pred2))
 
 
     def classifier_tests_secondstage(self, X_tr, y_tr, X_test, y_test):
@@ -655,7 +547,7 @@ class LetterDetection:
     def clustering_tests(self, pdfs):
         for syms in self.extract_nonbin_symbols(pdfs):
             print("%d symbols"%len(syms[0]))
-            padded_bins = self.prepare_for_clustering(syms[0], (25, 25))
+            padded_bins = prepare_for_clustering(syms[0], (25, 25))
             selection = {"nmf50": NMF(50, init="nndsvda"),
                          "nmf100": NMF(100, init="nndsvda"),
                          "nmf300": NMF(300, init="nndsvda"),
@@ -682,6 +574,39 @@ class LetterDetection:
                     print(silhouette_score(selected, clustered))
                     print(len(set(clustered)))
 
+    def test_segsystem_on_page(self, page, model_path, encoder_path):
+        img = cv2.imread(page)
+        img = self.transform_page(img)
+        img = self.get_bounding_box(img)
+        im, contours, hierarchy = get_contours(img)
+        lines = sort_contours(contours)
+        line_crops = [cut_contours_new(img, x) for x in lines]
+        model = Sequential()
+        model.load_weights("models/" + model_path)
+        encoder = load_encoder(encoder_path)
+        line_preds = [model.predict(line) for line in line_crops]
+        text = "\n".join("".join(encoder.inverse_transform(line_preds)))
+        with open("test.txt", "w") as io:
+            io.write(text)
+
+
+    def get_symbol_size_counts(self, pages):
+        contours_all = []
+        for page in pages:
+            img = cv2.imread(page)
+            img = self.transform_page(img)
+            img = self.get_bounding_box(img)
+            im, contours, hierarchy = get_contours(img)
+            contours_all.extend(contours)
+        areas = [cv2.contourArea(x) for x in contours_all]
+        mean_area = np.mean(areas)
+        sd_area = np.std(areas)
+        median_area = np.median(areas)
+        print(f"MEAN: {mean_area}, MEDIAN: {median_area}, DEVIATION: {sd_area}")
+        sns.distplot(areas)
+        plt.show()
+
+
 
 
 
@@ -700,12 +625,15 @@ if __name__ == "__main__":
     #                                   "ostromirovo.pdf":(70, 90, False),
     #                                    "kievan.pdf":(70, 90, False)})
     # detection.clustering_tests({"kievgospel.pdf":(30, 40, False)})
-    symbols, labels = detection.prepare_for_classification(["kievgospel", "ostromirovo", "kievan"], pad_out=False, flatten=False)
+    symbols, labels = detection.prepare_for_classification(["kievgospel", "ostromirovo", "kievan"], pad_out=True, flatten=False, padded_shape=(24, 24))
     # sym_test, label_test = detection.prepare_for_classification(["ostromirovo"])
     # detection.classify_symbols({"kievgospel.pdf": (20, 40, False)}, ["kievgospel"])
     # #detection.cluster_symbols(symbols)
     #detection.classifier_tests_secondstage(symbols, labels, sym_test, label_test)
-    detection.nn_tests(symbols, labels)
+    save_encoder(labels, "label_encoder.pkl")
+    detection.nn_tests(symbols, labels, "sgd", "model3_3layers_sgd.h5")
+    detection.nn_tests(symbols, labels, "adam", "model3_3layers_adam.h5")
+    detection.nn_tests(symbols, labels, "rmsprop", "model3_3layers_rmsprop.h5")
 
 
 
